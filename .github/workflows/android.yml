@@ -1,0 +1,60 @@
+name: Application Android
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Copier l'application web dans l'APK
+        run: |
+          W=android/app/src/main/assets/www
+          mkdir -p "$W/leaflet" android/app/src/main/res/mipmap-xxxhdpi
+          cp index.html app.js style.css manifest.webmanifest icon-192.png icon-512.png "$W/"
+          curl -fsSL -o "$W/leaflet/leaflet.js" https://unpkg.com/leaflet@1.9.4/dist/leaflet.js
+          curl -fsSL -o "$W/leaflet/leaflet.css" https://unpkg.com/leaflet@1.9.4/dist/leaflet.css
+          sed -i 's#https://unpkg.com/leaflet@1.9.4/dist/#leaflet/#g' "$W/index.html"
+          grep -c 'leaflet/leaflet' "$W/index.html"
+          cp icon-192.png android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+
+      - name: Compiler l'APK
+        working-directory: android
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+        run: gradle --no-daemon --stacktrace assembleRelease
+
+      - name: Renommer
+        run: cp android/app/build/outputs/apk/release/app-release.apk affut-gps.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: affut-gps-apk
+          path: affut-gps.apk
+
+      - name: Publier dans Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Affût GPS 1.0.${{ github.run_number }}
+          body: |
+            Fichier à installer sur Android : affut-gps.apk
+            (version de test signée avec la clé de test)
+          files: affut-gps.apk
+          make_latest: true

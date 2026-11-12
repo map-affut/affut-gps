@@ -4,6 +4,8 @@
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const D2R = Math.PI / 180;
+/* Pont vers l'application Android (absent dans le navigateur) */
+const NATIVE = window.AffutNative || null;
 const store = {
   get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { toast("Mémoire pleine : enregistrement impossible"); } }
@@ -180,6 +182,11 @@ async function getWake() {
 }
 $('#bWake').onclick = async () => {
   wantWake = !wantWake;
+  if (NATIVE) {
+    NATIVE.setKeepScreenOn(wantWake);
+    toast(wantWake ? "L'écran restera allumé" : 'Mise en veille normale');
+    $('#bWake').classList.toggle('on', wantWake); return;
+  }
   if (wantWake) {
     if (!('wakeLock' in navigator) || !(await getWake())) { wantWake = false; toast("Impossible de garder l'écran allumé sur cet appareil"); }
     else toast("L'écran restera allumé");
@@ -299,8 +306,28 @@ function startRec(resume) {
   if (!resume) rec = { pts: [], dist: 0, t: Date.now() };
   recLine = L.polyline(rec.pts.map(p => [p[0], p[1]]), { color: '#ff5a4f', weight: 4 }).addTo(map);
   store.set('rec', rec); recUi();
+  // Dans l'application Android, le GPS est enregistré par un service natif (écran éteint compris)
+  if (NATIVE) { if (!resume) NATIVE.startTrack(true); else if (!NATIVE.isTracking()) NATIVE.startTrack(false); pullNative(); }
+}
+function pullNative() {
+  if (!NATIVE || !rec || !recLine) return;
+  let pts; try { pts = JSON.parse(NATIVE.trackPointsSince(rec.pts.length)); } catch (e) { return; }
+  if (!pts.length) return;
+  pts.forEach(p => {
+    const last = rec.pts[rec.pts.length - 1];
+    if (last) rec.dist += dist(last[0], last[1], p[0], p[1]);
+    rec.pts.push(p); recLine.addLatLng([p[0], p[1]]);
+  });
+  $('#recDist').textContent = fmtDist(rec.dist); store.set('rec', rec);
+}
+if (NATIVE) {
+  setInterval(pullNative, 3000);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') pullNative(); });
+  window.__nativeResume = pullNative;
+  window.__nativeBack = () => { if ($$('.sheet').some(x => !x.hidden)) { closeSheets(); return true; } return false; };
 }
 function recordPoint() {
+  if (NATIVE) return;
   if (!rec || !me || me.acc > 35) return;
   const last = rec.pts[rec.pts.length - 1];
   if (last) { const d = dist(last[0], last[1], me.lat, me.lon); if (d < 5) return; rec.dist += d; }
@@ -311,15 +338,17 @@ function recordPoint() {
 if (rec) { startRec(true); toast('Enregistrement de trace repris'); }
 $('#bRec').onclick = () => {
   if (!rec) { startRec(false); toast(me ? 'Enregistrement démarré' : 'Enregistrement démarré — en attente du GPS'); return; }
+  pullNative();
   const mins = Math.round((Date.now() - rec.t) / 60000);
   $('#tSummary').textContent = `${fmtDist(rec.dist)} parcourus · ${rec.pts.length} points · ${mins} min`;
   $('#tName').value = 'Trace du ' + fmtDate(rec.t);
   openSheet('sTrack');
 };
-function endRec() { if (recLine) map.removeLayer(recLine); recLine = null; rec = null; store.set('rec', null); recUi(); closeSheets(); }
+function endRec() { if (NATIVE) NATIVE.stopTrack(); if (recLine) map.removeLayer(recLine); recLine = null; rec = null; store.set('rec', null); recUi(); closeSheets(); }
 $('#tResume').onclick = closeSheets;
 $('#tDiscard').onclick = e => armConfirm(e.currentTarget, 'Confirmer ?', () => { endRec(); toast('Trace jetée'); });
 $('#tSave').onclick = () => {
+  pullNative();
   if (rec.pts.length < 2) { toast('Trace trop courte pour être enregistrée'); return; }
   tracks.push({ id: uid(), name: $('#tName').value.trim() || 'Trace', pts: rec.pts, dist: rec.dist, t: rec.t });
   store.set('tracks', tracks); drawT(); endRec(); toast('Trace enregistrée');
@@ -369,6 +398,7 @@ function buildGpx() {
 $('#gpxOut').onclick = async () => {
   if (!wpts.length && !tracks.length) { toast('Rien à exporter pour le moment'); return; }
   const name = `chasse-${new Date().toISOString().slice(0, 10)}.gpx`;
+  if (NATIVE) { NATIVE.shareFile(name, buildGpx(), 'application/gpx+xml'); return; }
   const file = new File([buildGpx()], name, { type: 'application/gpx+xml' });
   try { if (navigator.canShare?.({ files: [file] })) { await navigator.share({ files: [file], title: name }); return; } } catch (e) { if (e.name === 'AbortError') return; }
   const a = document.createElement('a'); a.href = URL.createObjectURL(file); a.download = name; document.body.appendChild(a); a.click();
@@ -425,17 +455,18 @@ function updateOff() {
   $('#oSize').textContent = '≈ ' + Math.max(1, Math.round(n * Ld.kb / 1024)).toLocaleString('fr-CA') + ' Mo';
   $('#oGo').disabled = n > MAX_TILES; $('#oGo').textContent = n > MAX_TILES ? 'Zone trop grande : zoome ou baisse le zoom max' : 'Télécharger cette zone';
   $('#oZones').textContent = zones.length;
-  if (navigator.storage?.estimate) navigator.storage.estimate().then(e => { $('#oUsage').textContent = Math.round(e.usage / 1048576).toLocaleString('fr-CA') + ' Mo sur ' + Math.round(e.quota / 1048576).toLocaleString('fr-CA') + ' Mo'; });
+  if (NATIVE) $('#oUsage').textContent = Math.round(+NATIVE.tileCacheBytes() / 1048576).toLocaleString('fr-CA') + ' Mo';
+  else if (navigator.storage?.estimate) navigator.storage.estimate().then(e => { $('#oUsage').textContent = Math.round(e.usage / 1048576).toLocaleString('fr-CA') + ' Mo sur ' + Math.round(e.quota / 1048576).toLocaleString('fr-CA') + ' Mo'; });
 }
 $('#oZmax').onchange = updateOff;
 $('#bOff').onclick = () => toggleSheet('sOff', () => { openSheet('sOff'); updateOff(); });
 $('#oGo').onclick = async () => {
-  if (!('caches' in window)) { toast("Ce navigateur ne permet pas le stockage des cartes"); return; }
+  if (!NATIVE && !('caches' in window)) { toast("Ce navigateur ne permet pas le stockage des cartes"); return; }
   if (!navigator.onLine) { toast('Connecte-toi à Internet pour télécharger la zone'); return; }
-  navigator.storage?.persist?.();
+  if (!NATIVE) navigator.storage?.persist?.();
   const { zmin, Ld } = offZooms(), zmax = +$('#oZmax').value, b = map.getBounds(), rs = ranges(b, zmin, zmax), total = countR(rs);
   const queue = []; rs.forEach(q => { for (let x = q.x0; x <= q.x1; x++) for (let y = q.y0; y <= q.y1; y++) queue.push([q.z, x, y]); });
-  const cache = await caches.open(TILE_CACHE);
+  const cache = NATIVE ? null : await caches.open(TILE_CACHE);
   dl = { stop: false, done: 0, err: 0 };
   $('#oProg').hidden = false; $('#oCancel').hidden = false; $('#oGo').disabled = true;
   const prog = () => { $('#oBar').style.width = (dl.done / total * 100) + '%'; $('#oProgTxt').textContent = `${dl.done.toLocaleString('fr-CA')} / ${total.toLocaleString('fr-CA')} tuiles${dl.err ? ` · ${dl.err} échec(s)` : ''}`; };
@@ -444,7 +475,11 @@ $('#oGo').onclick = async () => {
     while (!dl.stop && i < queue.length) {
       const [z, x, y] = queue[i++], url = tileUrl(Ld, z, x, y), key = tileKey(url);
       try {
-        if (!(await cache.match(key))) {
+        if (NATIVE) {
+          // L'application garde chaque tuile sur le téléphone au passage
+          const r = await fetch(url);
+          if (r.ok) await r.arrayBuffer(); else dl.err++;
+        } else if (!(await cache.match(key))) {
           const r = await fetch(url, { mode: 'cors' });
           if (r.ok) await cache.put(key, r); else dl.err++;
         }
@@ -461,9 +496,9 @@ $('#oGo').onclick = async () => {
 };
 $('#oCancel').onclick = () => { if (dl) dl.stop = true; };
 $('#oClear').onclick = e => armConfirm(e.currentTarget, 'Confirmer : tout effacer ?', async () => {
-  await caches.delete(TILE_CACHE); zones = []; store.set('zones', zones); drawZ(); updateOff(); toast('Cartes téléchargées effacées');
+  if (NATIVE) NATIVE.clearTiles(); else await caches.delete(TILE_CACHE); zones = []; store.set('zones', zones); drawZ(); updateOff(); toast('Cartes téléchargées effacées');
 });
 
 /* ---------- Service worker (mode hors ligne) ---------- */
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+if (!NATIVE && 'serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 recUi();
